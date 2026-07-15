@@ -1,0 +1,17 @@
+{
+  "name": "review-rag-demo",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -H 127.0.0.1 -p 8020",
+    "build": "next build",
+    "start": "next start -H 127.0.0.1 -p 8020"
+  },
+  "dependencies": {
+    "lucide-react": "^0.562.0",
+    "next": "^16.1.0",
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3"
+  },
+  "devDependencies": {}
+}
