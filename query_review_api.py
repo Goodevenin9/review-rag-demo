@@ -27,10 +27,10 @@ RECOMMENDATION_PRIORITY = {
 }
 
 PROFILE_WEIGHTS = {
-    "semantic": 0.30,
-    "tags": 0.43,
-    "fatal_risks": 0.12,
-    "recommendation": 0.10,
+    "semantic": 0.20,
+    "tags": 0.35,
+    "fatal_risks": 0.15,
+    "recommendation": 0.25,
     "issue_profile": 0.05,
 }
 
@@ -69,8 +69,17 @@ def detect_language(text: str) -> str:
 
 def normalize_recommendation(value: str | None) -> str:
     text = (value or "").strip()
+    lower = text.lower()
     if not text:
         return "无明确建议"
+    if any(term in lower for term in ["reject", "rejection", "rejected", "resubmit"]):
+        return "退稿/重投" if "resubmit" in lower else "退稿"
+    if any(term in lower for term in ["major revision", "major revise", "substantial revision"]):
+        return "大修"
+    if any(term in lower for term in ["minor revision", "minor revise"]):
+        return "小修"
+    if any(term in lower for term in ["accept", "accepted", "recommend acceptance"]):
+        return "推荐"
     if "拒" in text or "退" in text or "重投" in text:
         return "退稿/重投" if "重投" in text else "退稿"
     if "大修" in text or "重大" in text:
