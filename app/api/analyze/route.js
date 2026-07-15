@@ -40,7 +40,7 @@ export async function POST(request) {
   const form = await request.formData();
   const text = String(form.get("text") || "").trim();
   const file = form.get("file");
-  const args = ["query_review_api.py", "--top-k", "80", "--min-similarity", "0.45", "--limit", "5"];
+  const args = ["query_review_api.py", "--top-k", "100", "--min-similarity", "0.45", "--limit", "5"];
 
   if (file && typeof file === "object" && file.size > 0) {
     await mkdir(UPLOAD_DIR, { recursive: true });

@@ -57,6 +57,60 @@ function Distribution({ title, data }) {
   );
 }
 
+function ReportCard({ report, index, mode }) {
+  const scoreLabel = mode === "profile" ? "画像分" : "证据分";
+
+  return (
+    <article className="report-card">
+      <div className="report-head">
+        <div>
+          <span className="rank">#{index + 1}</span>
+          <h3>{report.title || report.manuscript_id || "未命名稿件"}</h3>
+          <p>
+            {report.manuscript_id || "无稿件 ID"} · {report.record_type} ·{" "}
+            {report.recommendation || "无明确建议"}
+          </p>
+        </div>
+        <div className="score-badge">
+          <strong>{report.similarity}</strong>
+          <span>{report.level}</span>
+        </div>
+      </div>
+
+      <div className="score-row">
+        <span>{scoreLabel} {report.similarity || "-"}</span>
+        <span>原文 {report.raw_similarity || "-"}</span>
+        <span>文本语言 {report.language || "-"}</span>
+        <span>创新 {report.scores?.innovation_science || "-"}</span>
+        <span>工作量 {report.scores?.workload || "-"}</span>
+        <span>范式 {report.scores?.academic_norm || "-"}</span>
+        <span>语言分 {report.scores?.language_logic || "-"}</span>
+      </div>
+
+      {report.rerank && (
+        <div className="score-row rerank-row">
+          <span>语义 {report.rerank.semantic}</span>
+          <span>标签 {report.rerank.tag_overlap}</span>
+          <span>风险 {report.rerank.fatal_risk_overlap}</span>
+          <span>建议 {report.rerank.recommendation_match}</span>
+          <span>画像 {report.rerank.issue_profile_boost}</span>
+        </div>
+      )}
+
+      <div className="chips compact">
+        {(report.tags || []).slice(0, 10).map((tag) => (
+          <Chip key={tag} tone="soft">{tag}</Chip>
+        ))}
+        {(report.fatal_risks || []).map((risk) => (
+          <Chip key={risk} tone="danger">{risk}</Chip>
+        ))}
+      </div>
+
+      <p className="excerpt">{report.excerpt}</p>
+    </article>
+  );
+}
+
 export default function Home() {
   const [text, setText] = useState("");
   const [file, setFile] = useState(null);
@@ -64,7 +118,8 @@ export default function Home() {
   const [result, setResult] = useState(null);
   const [error, setError] = useState("");
 
-  const topReports = result?.reports || [];
+  const profileMatches = result?.profile_matches || result?.reports || [];
+  const evidenceMatches = result?.evidence_matches || [];
   const topTagEntries = useMemo(() => Object.entries(result?.top_tags || {}).slice(0, 12), [result]);
 
   async function submit(event) {
@@ -98,7 +153,7 @@ export default function Home() {
           </div>
           <div>
             <h1>审稿意见向量库</h1>
-            <p>字段化 bge-m3 + Chroma 检索</p>
+            <p>双通道检索：判断与证据分离</p>
           </div>
         </div>
 
@@ -137,15 +192,15 @@ export default function Home() {
 
         <div className="note">
           <CheckCircle2 size={16} />
-          数据留在本机，后端调用本地 Python、bge-m3 与 Chroma。
+          数据留在本机。画像通道用于判断，原文通道用于证据。
         </div>
       </aside>
 
       <section className="content">
         <header className="topbar">
           <div>
-            <p className="eyebrow">Review Intelligence</p>
-            <h2>返回 5 篇相似稿件</h2>
+            <p className="eyebrow">Dual Channel Review RAG</p>
+            <h2>判断看画像，证据看原文</h2>
           </div>
           <div className="index-meta">
             <span>7084 向量记录</span>
@@ -164,7 +219,7 @@ export default function Home() {
           <div className="empty">
             <Search size={34} />
             <h3>等待输入</h3>
-            <p>系统会解析上传文件或文本，检索字段化审稿意见向量库，并按稿件聚合输出相似记录、标签与历史倾向。</p>
+            <p>系统会同时输出数据库判断和原文证据，避免把语言相似误当成审稿判断相似。</p>
           </div>
         )}
 
@@ -180,7 +235,7 @@ export default function Home() {
           <>
             <section className="summary-grid">
               <Stat label="相似稿件数" value={`${result.effective_matches ?? "-"} 篇`} icon={<Search size={18} />} />
-              <Stat label="稿件级历史倾向" value={result.database_tendency} icon={<Database size={18} />} />
+              <Stat label="数据库判断" value={result.database_tendency} icon={<Database size={18} />} />
               <Stat label="输入建议倾向" value={result.input_recommendation_tendency} icon={<BarChart3 size={18} />} />
             </section>
 
@@ -188,91 +243,54 @@ export default function Home() {
               <h2>输入问题画像</h2>
               <p className="summary-text">{result.input_summary}</p>
               <div className="chips">
-                {(result.input_tags || []).map((tag) => (
-                  <Chip key={tag}>{tag}</Chip>
-                ))}
+                {(result.input_tags || []).map((tag) => <Chip key={tag}>{tag}</Chip>)}
                 {(result.fatal_risks || []).map((risk) => (
-                  <Chip key={risk} tone="danger">
-                    {risk}
-                  </Chip>
+                  <Chip key={risk} tone="danger">{risk}</Chip>
                 ))}
               </div>
             </section>
 
             <div className="two-col">
-              <Distribution title="稿件级推荐分布" data={result.recommendation_distribution} />
-              <Distribution title="记录类型分布" data={result.record_type_distribution} />
+              <Distribution title="画像通道推荐分布" data={result.recommendation_distribution} />
+              <Distribution title="候选语言分布" data={result.language_distribution} />
             </div>
-
-            <Distribution title="候选语言分布" data={result.language_distribution} />
 
             <section className="panel">
               <h2>高频历史标签</h2>
               <div className="chips">
                 {topTagEntries.map(([tag, count]) => (
-                  <Chip key={tag} tone="soft">
-                    {tag} x {count}
-                  </Chip>
+                  <Chip key={tag} tone="soft">{tag} x {count}</Chip>
                 ))}
               </div>
             </section>
 
             <section className="reports">
               <div className="section-title">
-                <h2>最近 5 篇相似稿件</h2>
-                <span>每篇稿件只取最高相似记录，含评分、标签与原文片段</span>
+                <h2>画像相似稿件 Top 5</h2>
+                <span>用于数据库判断：问题标签、风险、建议倾向权重更高</span>
               </div>
-              {topReports.map((report, index) => (
-                <article className="report-card" key={`${report.manuscript_id}-${index}`}>
-                  <div className="report-head">
-                    <div>
-                      <span className="rank">#{index + 1}</span>
-                      <h3>{report.title || report.manuscript_id || "未命名稿件"}</h3>
-                      <p>
-                        {report.manuscript_id || "无稿件 ID"} · {report.record_type} ·{" "}
-                        {report.recommendation || "无明确建议"}
-                      </p>
-                    </div>
-                    <div className="score-badge">
-                      <strong>{report.similarity}</strong>
-                      <span>{report.level}</span>
-                    </div>
-                  </div>
+              {profileMatches.map((report, index) => (
+                <ReportCard
+                  key={`profile-${report.manuscript_id}-${index}`}
+                  report={report}
+                  index={index}
+                  mode="profile"
+                />
+              ))}
+            </section>
 
-                  <div className="score-row">
-                    <span>语义 {report.raw_similarity || "-"}</span>
-                    <span>文本语言 {report.language || "-"}</span>
-                    <span>创新 {report.scores?.innovation_science || "-"}</span>
-                    <span>工作量 {report.scores?.workload || "-"}</span>
-                    <span>范式 {report.scores?.academic_norm || "-"}</span>
-                    <span>语言分 {report.scores?.language_logic || "-"}</span>
-                  </div>
-
-                  {report.rerank && (
-                    <div className="score-row rerank-row">
-                      <span>语义 {report.rerank.semantic}</span>
-                      <span>标签 {report.rerank.tag_overlap}</span>
-                      <span>风险 {report.rerank.fatal_risk_overlap}</span>
-                      <span>建议 {report.rerank.recommendation_match}</span>
-                      <span>画像 {report.rerank.issue_profile_boost}</span>
-                    </div>
-                  )}
-
-                  <div className="chips compact">
-                    {(report.tags || []).slice(0, 10).map((tag) => (
-                      <Chip key={tag} tone="soft">
-                        {tag}
-                      </Chip>
-                    ))}
-                    {(report.fatal_risks || []).map((risk) => (
-                      <Chip key={risk} tone="danger">
-                        {risk}
-                      </Chip>
-                    ))}
-                  </div>
-
-                  <p className="excerpt">{report.excerpt}</p>
-                </article>
+            <section className="reports">
+              <div className="section-title">
+                <h2>原文审稿证据 Top 5</h2>
+                <span>用于参考表达：原文语义相似度权重更高，不直接决定数据库判断</span>
+              </div>
+              {evidenceMatches.map((report, index) => (
+                <ReportCard
+                  key={`evidence-${report.manuscript_id}-${index}`}
+                  report={report}
+                  index={index}
+                  mode="evidence"
+                />
               ))}
             </section>
           </>

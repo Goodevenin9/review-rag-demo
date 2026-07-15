@@ -26,12 +26,18 @@ RECOMMENDATION_PRIORITY = {
     "": 0,
 }
 
-RERANK_WEIGHTS = {
-    "semantic": 0.35,
-    "tags": 0.40,
+PROFILE_WEIGHTS = {
+    "semantic": 0.30,
+    "tags": 0.43,
     "fatal_risks": 0.12,
-    "recommendation": 0.08,
+    "recommendation": 0.10,
     "issue_profile": 0.05,
+}
+
+EVIDENCE_WEIGHTS = {
+    "semantic": 0.75,
+    "tags": 0.15,
+    "recommendation": 0.10,
 }
 
 
@@ -87,7 +93,6 @@ def aggregate_recommendation(recommendations: list[str]) -> str:
     if top_count / len(meaningful) >= 0.5:
         return top_label
 
-    # Conservative tie-break: when reviewers disagree, expose the stricter tendency.
     return max(meaningful, key=lambda item: RECOMMENDATION_PRIORITY.get(item, 0))
 
 
@@ -116,16 +121,6 @@ def jaccard(left: list[str], right: list[str]) -> float:
     return len(left_set & right_set) / len(left_set | right_set)
 
 
-def rerank_level(score: float) -> str:
-    if score >= 0.38:
-        return "高画像匹配"
-    if score >= 0.28:
-        return "中画像匹配"
-    if score >= 0.18:
-        return "弱画像匹配"
-    return "仅供参考"
-
-
 def recommendation_match_score(left: str, right: str) -> float:
     left = normalize_recommendation(left)
     right = normalize_recommendation(right)
@@ -140,6 +135,24 @@ def recommendation_match_score(left: str, right: str) -> float:
     if left in lenient and right in lenient:
         return 0.55
     return 0.0
+
+
+def match_level(score: float, channel: str) -> str:
+    if channel == "profile":
+        if score >= 0.38:
+            return "高画像匹配"
+        if score >= 0.28:
+            return "中画像匹配"
+        if score >= 0.18:
+            return "弱画像匹配"
+        return "仅供参考"
+    if score >= 0.70:
+        return "强原文相似"
+    if score >= 0.55:
+        return "中原文相似"
+    if score >= 0.45:
+        return "弱原文相似"
+    return "仅供参考"
 
 
 def load_input(file_path: str | None, text: str | None) -> tuple[str, dict]:
@@ -162,7 +175,7 @@ def manuscript_key(meta: dict) -> str:
     )
 
 
-def rerank_candidate(
+def enrich_candidate(
     raw_similarity: float,
     doc: str,
     meta: dict,
@@ -170,33 +183,38 @@ def rerank_candidate(
     input_fatal_risks: list[str],
     input_recommendation: str,
 ) -> dict:
-    candidate_tags = split_labels(meta.get("detected_tags") or meta.get("tags"))
-    candidate_fatal_risks = split_labels(meta.get("fatal_risks"))
-    candidate_recommendation = normalize_recommendation(meta.get("reviewer_recommendation", ""))
-
-    tag_score = jaccard(input_tags, candidate_tags)
-    fatal_score = jaccard(input_fatal_risks, candidate_fatal_risks)
-    rec_score = recommendation_match_score(input_recommendation, candidate_recommendation)
+    tags = split_labels(meta.get("detected_tags") or meta.get("tags"))
+    fatal_risks = split_labels(meta.get("fatal_risks"))
+    recommendation = normalize_recommendation(meta.get("reviewer_recommendation", ""))
+    tag_score = jaccard(input_tags, tags)
+    fatal_score = jaccard(input_fatal_risks, fatal_risks)
+    rec_score = recommendation_match_score(input_recommendation, recommendation)
     issue_profile_score = 1.0 if meta.get("record_type") == "issue_profile" else 0.0
 
-    final_score = (
-        RERANK_WEIGHTS["semantic"] * raw_similarity
-        + RERANK_WEIGHTS["tags"] * tag_score
-        + RERANK_WEIGHTS["fatal_risks"] * fatal_score
-        + RERANK_WEIGHTS["recommendation"] * rec_score
-        + RERANK_WEIGHTS["issue_profile"] * issue_profile_score
+    profile_score = (
+        PROFILE_WEIGHTS["semantic"] * raw_similarity
+        + PROFILE_WEIGHTS["tags"] * tag_score
+        + PROFILE_WEIGHTS["fatal_risks"] * fatal_score
+        + PROFILE_WEIGHTS["recommendation"] * rec_score
+        + PROFILE_WEIGHTS["issue_profile"] * issue_profile_score
+    )
+    evidence_score = (
+        EVIDENCE_WEIGHTS["semantic"] * raw_similarity
+        + EVIDENCE_WEIGHTS["tags"] * tag_score
+        + EVIDENCE_WEIGHTS["recommendation"] * rec_score
     )
 
     return {
-        "final_score": final_score,
+        "profile_score": profile_score,
+        "evidence_score": evidence_score,
         "raw_similarity": raw_similarity,
         "doc": doc,
         "meta": meta,
-        "tags": candidate_tags,
-        "fatal_risks": candidate_fatal_risks,
-        "recommendation": candidate_recommendation,
+        "tags": tags,
+        "fatal_risks": fatal_risks,
+        "recommendation": recommendation,
         "language": detect_language(doc),
-        "rerank": {
+        "scores": {
             "semantic": round(raw_similarity, 4),
             "tag_overlap": round(tag_score, 4),
             "fatal_risk_overlap": round(fatal_score, 4),
@@ -206,13 +224,14 @@ def rerank_candidate(
     }
 
 
-def make_report(candidate: dict) -> dict:
+def make_report(candidate: dict, channel: str) -> dict:
     meta = candidate["meta"]
-    final_score = candidate["final_score"]
+    score = candidate["profile_score"] if channel == "profile" else candidate["evidence_score"]
     return {
-        "similarity": round(final_score, 4),
+        "similarity": round(score, 4),
         "raw_similarity": round(candidate["raw_similarity"], 4),
-        "level": rerank_level(final_score),
+        "level": match_level(score, channel),
+        "channel": channel,
         "record_type": meta.get("record_type", ""),
         "recommendation": candidate["recommendation"],
         "manuscript_id": meta.get("manuscript_id", ""),
@@ -226,23 +245,22 @@ def make_report(candidate: dict) -> dict:
         "tags": candidate["tags"],
         "fatal_risks": candidate["fatal_risks"],
         "language": candidate["language"],
-        "rerank": candidate["rerank"],
+        "rerank": candidate["scores"],
         "file_name": meta.get("file_name", ""),
         "file_path": meta.get("file_path", ""),
         "excerpt": candidate["doc"][:900],
     }
 
 
-def group_by_manuscript(candidates: list[dict]) -> list[dict]:
+def group_profile_matches(candidates: list[dict]) -> list[dict]:
     grouped = defaultdict(list)
     for candidate in candidates:
         grouped[manuscript_key(candidate["meta"])].append(candidate)
 
     manuscripts = []
     for key, items in grouped.items():
-        items.sort(key=lambda item: item["final_score"], reverse=True)
+        items.sort(key=lambda item: item["profile_score"], reverse=True)
         top = items[0]
-        recs = [item["recommendation"] for item in items]
         tag_counter = Counter()
         type_counter = Counter()
         fatal_counter = Counter()
@@ -259,20 +277,44 @@ def group_by_manuscript(candidates: list[dict]) -> list[dict]:
         manuscripts.append(
             {
                 "key": key,
-                "similarity": top["final_score"],
+                "similarity": top["profile_score"],
                 "raw_similarity": top["raw_similarity"],
-                "recommendation": aggregate_recommendation(recs),
+                "recommendation": aggregate_recommendation([item["recommendation"] for item in items]),
                 "record_count": len(items),
                 "record_type_distribution": dict(type_counter),
                 "language_distribution": dict(language_counter),
                 "tags": dict(tag_counter),
                 "fatal_risks": dict(fatal_counter),
-                "top_report": make_report(top),
+                "top_report": make_report(top, "profile"),
             }
         )
 
     manuscripts.sort(key=lambda item: item["similarity"], reverse=True)
     return manuscripts
+
+
+def evidence_matches(candidates: list[dict], limit: int) -> list[dict]:
+    evidence_candidates = [
+        item for item in candidates if item["meta"].get("record_type") != "issue_profile"
+    ] or candidates
+
+    seen = set()
+    reports = []
+    for candidate in sorted(evidence_candidates, key=lambda item: item["evidence_score"], reverse=True):
+        meta = candidate["meta"]
+        key = (
+            manuscript_key(meta),
+            meta.get("record_type", ""),
+            meta.get("file_path", ""),
+            candidate["doc"][:80],
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        reports.append(make_report(candidate, "evidence"))
+        if len(reports) >= limit:
+            break
+    return reports
 
 
 def query(text: str, top_k: int, min_similarity: float, limit: int):
@@ -292,7 +334,7 @@ def query(text: str, top_k: int, min_similarity: float, limit: int):
         raw_similarity = 1 - float(distance)
         if raw_similarity >= min_similarity:
             candidates.append(
-                rerank_candidate(
+                enrich_candidate(
                     raw_similarity,
                     doc,
                     meta,
@@ -302,7 +344,9 @@ def query(text: str, top_k: int, min_similarity: float, limit: int):
                 )
             )
 
-    manuscripts = group_by_manuscript(candidates)
+    profile_manuscripts = group_profile_matches(candidates)
+    profile_reports = [item["top_report"] for item in profile_manuscripts[:limit]]
+    evidence_reports = evidence_matches(candidates, limit)
 
     weighted_recommendations = Counter()
     record_type_counter = Counter()
@@ -311,7 +355,7 @@ def query(text: str, top_k: int, min_similarity: float, limit: int):
     fatal_counter = Counter()
     total_source_records = 0
 
-    for manuscript in manuscripts:
+    for manuscript in profile_manuscripts:
         weight = manuscript["similarity"]
         weighted_recommendations[manuscript["recommendation"]] += weight
         total_source_records += manuscript["record_count"]
@@ -330,11 +374,9 @@ def query(text: str, top_k: int, min_similarity: float, limit: int):
     }
     database_tendency = (
         database_recommendation_from_distribution(recommendation_distribution)
-        if len(manuscripts) >= 5
+        if len(profile_manuscripts) >= 5
         else "相似稿件不足，需编辑判断"
     )
-
-    reports = [manuscript["top_report"] for manuscript in manuscripts[:limit]]
 
     return {
         "input_summary": text[:500],
@@ -342,22 +384,28 @@ def query(text: str, top_k: int, min_similarity: float, limit: int):
         "input_recommendation_tendency": input_recommendation,
         "input_language": input_language,
         "fatal_risks": input_fatal_risks,
-        "effective_matches": len(manuscripts),
+        "effective_matches": len(profile_manuscripts),
         "source_record_matches": total_source_records,
-        "aggregation_mode": "manuscript_weighted_rerank",
-        "rerank_weights": RERANK_WEIGHTS,
+        "aggregation_mode": "dual_channel_profile_and_evidence",
+        "profile_weights": PROFILE_WEIGHTS,
+        "evidence_weights": EVIDENCE_WEIGHTS,
         "database_tendency": database_tendency,
         "recommendation_distribution": recommendation_distribution,
         "record_type_distribution": dict(record_type_counter),
         "language_distribution": dict(language_counter),
         "top_tags": dict(tag_counter.most_common(12)),
         "top_fatal_risks": dict(fatal_counter.most_common(8)),
-        "reports": reports,
+        "profile_matches": profile_reports,
+        "evidence_matches": evidence_reports,
+        "reports": profile_reports,
         "thresholds": {
             "min_similarity": min_similarity,
-            "rerank_high": 0.38,
-            "rerank_medium": 0.28,
-            "rerank_weak": 0.18,
+            "profile_high": 0.38,
+            "profile_medium": 0.28,
+            "profile_weak": 0.18,
+            "evidence_strong": 0.70,
+            "evidence_medium": 0.55,
+            "evidence_weak": 0.45,
         },
     }
 
@@ -368,7 +416,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--file")
     parser.add_argument("--text")
-    parser.add_argument("--top-k", type=int, default=80)
+    parser.add_argument("--top-k", type=int, default=100)
     parser.add_argument("--min-similarity", type=float, default=0.45)
     parser.add_argument("--limit", type=int, default=5)
     args = parser.parse_args()
