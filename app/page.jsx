@@ -204,6 +204,8 @@ export default function Home() {
               <Distribution title="记录类型分布" data={result.record_type_distribution} />
             </div>
 
+            <Distribution title="候选语言分布" data={result.language_distribution} />
+
             <section className="panel">
               <h2>高频历史标签</h2>
               <div className="chips">
@@ -238,11 +240,23 @@ export default function Home() {
                   </div>
 
                   <div className="score-row">
+                    <span>语义 {report.raw_similarity || "-"}</span>
+                    <span>文本语言 {report.language || "-"}</span>
                     <span>创新 {report.scores?.innovation_science || "-"}</span>
                     <span>工作量 {report.scores?.workload || "-"}</span>
                     <span>范式 {report.scores?.academic_norm || "-"}</span>
-                    <span>语言 {report.scores?.language_logic || "-"}</span>
+                    <span>语言分 {report.scores?.language_logic || "-"}</span>
                   </div>
+
+                  {report.rerank && (
+                    <div className="score-row rerank-row">
+                      <span>语义 {report.rerank.semantic}</span>
+                      <span>标签 {report.rerank.tag_overlap}</span>
+                      <span>风险 {report.rerank.fatal_risk_overlap}</span>
+                      <span>建议 {report.rerank.recommendation_match}</span>
+                      <span>画像 {report.rerank.issue_profile_boost}</span>
+                    </div>
+                  )}
 
                   <div className="chips compact">
                     {(report.tags || []).slice(0, 10).map((tag) => (

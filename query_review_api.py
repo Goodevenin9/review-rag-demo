@@ -1,12 +1,13 @@
 import argparse
 import json
+import re
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
 import chromadb
 
-from bge_chroma_query import detect_query_tags, similarity_level
+from bge_chroma_query import detect_query_tags
 from bge_embedder import LocalBGEEmbedder
 from build_field_chroma import CHROMA_DIR, COLLECTION, MODEL
 from build_index import extract_text
@@ -25,6 +26,14 @@ RECOMMENDATION_PRIORITY = {
     "": 0,
 }
 
+RERANK_WEIGHTS = {
+    "semantic": 0.35,
+    "tags": 0.40,
+    "fatal_risks": 0.12,
+    "recommendation": 0.08,
+    "issue_profile": 0.05,
+}
+
 
 def normalize_text(text: str) -> str:
     return " ".join((text or "").split())
@@ -37,6 +46,19 @@ def split_labels(value: str | None) -> list[str]:
     for sep in ["；", ";", "，", ",", "|", "/", "\n"]:
         normalized = normalized.replace(sep, "；")
     return [item.strip() for item in normalized.split("；") if item.strip()]
+
+
+def detect_language(text: str) -> str:
+    sample = re.sub(r"\s+", "", text or "")[:1200]
+    if not sample:
+        return "unknown"
+    chinese = len(re.findall(r"[\u4e00-\u9fff]", sample))
+    latin = len(re.findall(r"[A-Za-z]", sample))
+    if chinese >= max(12, latin * 0.35):
+        return "zh"
+    if latin >= max(30, chinese * 2):
+        return "en"
+    return "mixed"
 
 
 def normalize_recommendation(value: str | None) -> str:
@@ -86,6 +108,40 @@ def database_recommendation_from_distribution(distribution: dict[str, float]) ->
     return "小修/推荐"
 
 
+def jaccard(left: list[str], right: list[str]) -> float:
+    left_set = {item for item in left if item}
+    right_set = {item for item in right if item}
+    if not left_set or not right_set:
+        return 0.0
+    return len(left_set & right_set) / len(left_set | right_set)
+
+
+def rerank_level(score: float) -> str:
+    if score >= 0.38:
+        return "高画像匹配"
+    if score >= 0.28:
+        return "中画像匹配"
+    if score >= 0.18:
+        return "弱画像匹配"
+    return "仅供参考"
+
+
+def recommendation_match_score(left: str, right: str) -> float:
+    left = normalize_recommendation(left)
+    right = normalize_recommendation(right)
+    if left == "无明确建议" or right == "无明确建议":
+        return 0.0
+    if left == right:
+        return 1.0
+    strict = {"退稿", "退稿/重投", "大修"}
+    lenient = {"小修", "推荐", "录用"}
+    if left in strict and right in strict:
+        return 0.55
+    if left in lenient and right in lenient:
+        return 0.55
+    return 0.0
+
+
 def load_input(file_path: str | None, text: str | None) -> tuple[str, dict]:
     meta = {"input_type": "text", "file_name": ""}
     if file_path:
@@ -106,12 +162,59 @@ def manuscript_key(meta: dict) -> str:
     )
 
 
-def make_report(similarity: float, doc: str, meta: dict) -> dict:
+def rerank_candidate(
+    raw_similarity: float,
+    doc: str,
+    meta: dict,
+    input_tags: list[str],
+    input_fatal_risks: list[str],
+    input_recommendation: str,
+) -> dict:
+    candidate_tags = split_labels(meta.get("detected_tags") or meta.get("tags"))
+    candidate_fatal_risks = split_labels(meta.get("fatal_risks"))
+    candidate_recommendation = normalize_recommendation(meta.get("reviewer_recommendation", ""))
+
+    tag_score = jaccard(input_tags, candidate_tags)
+    fatal_score = jaccard(input_fatal_risks, candidate_fatal_risks)
+    rec_score = recommendation_match_score(input_recommendation, candidate_recommendation)
+    issue_profile_score = 1.0 if meta.get("record_type") == "issue_profile" else 0.0
+
+    final_score = (
+        RERANK_WEIGHTS["semantic"] * raw_similarity
+        + RERANK_WEIGHTS["tags"] * tag_score
+        + RERANK_WEIGHTS["fatal_risks"] * fatal_score
+        + RERANK_WEIGHTS["recommendation"] * rec_score
+        + RERANK_WEIGHTS["issue_profile"] * issue_profile_score
+    )
+
     return {
-        "similarity": round(similarity, 4),
-        "level": similarity_level(similarity),
+        "final_score": final_score,
+        "raw_similarity": raw_similarity,
+        "doc": doc,
+        "meta": meta,
+        "tags": candidate_tags,
+        "fatal_risks": candidate_fatal_risks,
+        "recommendation": candidate_recommendation,
+        "language": detect_language(doc),
+        "rerank": {
+            "semantic": round(raw_similarity, 4),
+            "tag_overlap": round(tag_score, 4),
+            "fatal_risk_overlap": round(fatal_score, 4),
+            "recommendation_match": round(rec_score, 4),
+            "issue_profile_boost": issue_profile_score,
+        },
+    }
+
+
+def make_report(candidate: dict) -> dict:
+    meta = candidate["meta"]
+    final_score = candidate["final_score"]
+    return {
+        "similarity": round(final_score, 4),
+        "raw_similarity": round(candidate["raw_similarity"], 4),
+        "level": rerank_level(final_score),
         "record_type": meta.get("record_type", ""),
-        "recommendation": normalize_recommendation(meta.get("reviewer_recommendation", "")),
+        "recommendation": candidate["recommendation"],
         "manuscript_id": meta.get("manuscript_id", ""),
         "title": meta.get("title", ""),
         "scores": {
@@ -120,45 +223,51 @@ def make_report(similarity: float, doc: str, meta: dict) -> dict:
             "academic_norm": meta.get("score_academic_norm", ""),
             "language_logic": meta.get("score_language_logic", ""),
         },
-        "tags": split_labels(meta.get("detected_tags") or meta.get("tags")),
-        "fatal_risks": split_labels(meta.get("fatal_risks")),
+        "tags": candidate["tags"],
+        "fatal_risks": candidate["fatal_risks"],
+        "language": candidate["language"],
+        "rerank": candidate["rerank"],
         "file_name": meta.get("file_name", ""),
         "file_path": meta.get("file_path", ""),
-        "excerpt": doc[:900],
+        "excerpt": candidate["doc"][:900],
     }
 
 
-def group_by_manuscript(candidates: list[tuple[float, str, dict]]) -> list[dict]:
+def group_by_manuscript(candidates: list[dict]) -> list[dict]:
     grouped = defaultdict(list)
-    for similarity, doc, meta in candidates:
-        grouped[manuscript_key(meta)].append((similarity, doc, meta))
+    for candidate in candidates:
+        grouped[manuscript_key(candidate["meta"])].append(candidate)
 
     manuscripts = []
     for key, items in grouped.items():
-        items.sort(key=lambda item: item[0], reverse=True)
-        top_similarity, top_doc, top_meta = items[0]
-        recs = [item[2].get("reviewer_recommendation", "") for item in items]
+        items.sort(key=lambda item: item["final_score"], reverse=True)
+        top = items[0]
+        recs = [item["recommendation"] for item in items]
         tag_counter = Counter()
         type_counter = Counter()
         fatal_counter = Counter()
+        language_counter = Counter()
 
-        for _, _, meta in items:
-            type_counter[meta.get("record_type", "")] += 1
-            for tag in split_labels(meta.get("detected_tags") or meta.get("tags")):
+        for item in items:
+            type_counter[item["meta"].get("record_type", "")] += 1
+            language_counter[item["language"]] += 1
+            for tag in item["tags"]:
                 tag_counter[tag] += 1
-            for risk in split_labels(meta.get("fatal_risks")):
+            for risk in item["fatal_risks"]:
                 fatal_counter[risk] += 1
 
         manuscripts.append(
             {
                 "key": key,
-                "similarity": top_similarity,
+                "similarity": top["final_score"],
+                "raw_similarity": top["raw_similarity"],
                 "recommendation": aggregate_recommendation(recs),
                 "record_count": len(items),
                 "record_type_distribution": dict(type_counter),
+                "language_distribution": dict(language_counter),
                 "tags": dict(tag_counter),
                 "fatal_risks": dict(fatal_counter),
-                "top_report": make_report(top_similarity, top_doc, top_meta),
+                "top_report": make_report(top),
             }
         )
 
@@ -167,6 +276,11 @@ def group_by_manuscript(candidates: list[tuple[float, str, dict]]) -> list[dict]
 
 
 def query(text: str, top_k: int, min_similarity: float, limit: int):
+    input_tags = detect_tags(text, max_tags=12) or detect_query_tags(text)
+    input_fatal_risks = detect_fatal_risks(text)
+    input_recommendation = detect_recommendation(text)
+    input_language = detect_language(text)
+
     model = LocalBGEEmbedder(MODEL)
     client = chromadb.PersistentClient(path=str(CHROMA_DIR))
     collection = client.get_collection(COLLECTION)
@@ -175,14 +289,24 @@ def query(text: str, top_k: int, min_similarity: float, limit: int):
 
     candidates = []
     for doc, meta, distance in zip(result["documents"][0], result["metadatas"][0], result["distances"][0]):
-        similarity = 1 - float(distance)
-        if similarity >= min_similarity:
-            candidates.append((similarity, doc, meta))
+        raw_similarity = 1 - float(distance)
+        if raw_similarity >= min_similarity:
+            candidates.append(
+                rerank_candidate(
+                    raw_similarity,
+                    doc,
+                    meta,
+                    input_tags,
+                    input_fatal_risks,
+                    input_recommendation,
+                )
+            )
 
     manuscripts = group_by_manuscript(candidates)
 
     weighted_recommendations = Counter()
     record_type_counter = Counter()
+    language_counter = Counter()
     tag_counter = Counter()
     fatal_counter = Counter()
     total_source_records = 0
@@ -194,6 +318,8 @@ def query(text: str, top_k: int, min_similarity: float, limit: int):
 
         for record_type, count in manuscript["record_type_distribution"].items():
             record_type_counter[record_type] += count
+        for language, count in manuscript["language_distribution"].items():
+            language_counter[language] += count
         for tag in manuscript["tags"]:
             tag_counter[tag] += 1
         for risk in manuscript["fatal_risks"]:
@@ -210,29 +336,28 @@ def query(text: str, top_k: int, min_similarity: float, limit: int):
 
     reports = [manuscript["top_report"] for manuscript in manuscripts[:limit]]
 
-    input_tags = detect_tags(text, max_tags=12)
-    fatal_risks = detect_fatal_risks(text)
-    reviewer_tendency = detect_recommendation(text)
-
     return {
         "input_summary": text[:500],
-        "input_tags": input_tags or detect_query_tags(text),
-        "input_recommendation_tendency": reviewer_tendency,
-        "fatal_risks": fatal_risks,
+        "input_tags": input_tags,
+        "input_recommendation_tendency": input_recommendation,
+        "input_language": input_language,
+        "fatal_risks": input_fatal_risks,
         "effective_matches": len(manuscripts),
         "source_record_matches": total_source_records,
-        "aggregation_mode": "manuscript_weighted",
+        "aggregation_mode": "manuscript_weighted_rerank",
+        "rerank_weights": RERANK_WEIGHTS,
         "database_tendency": database_tendency,
         "recommendation_distribution": recommendation_distribution,
         "record_type_distribution": dict(record_type_counter),
+        "language_distribution": dict(language_counter),
         "top_tags": dict(tag_counter.most_common(12)),
         "top_fatal_risks": dict(fatal_counter.most_common(8)),
         "reports": reports,
         "thresholds": {
             "min_similarity": min_similarity,
-            "strong": 0.75,
-            "medium": 0.60,
-            "weak": 0.45,
+            "rerank_high": 0.38,
+            "rerank_medium": 0.28,
+            "rerank_weak": 0.18,
         },
     }
 
@@ -243,7 +368,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--file")
     parser.add_argument("--text")
-    parser.add_argument("--top-k", type=int, default=30)
+    parser.add_argument("--top-k", type=int, default=80)
     parser.add_argument("--min-similarity", type=float, default=0.45)
     parser.add_argument("--limit", type=int, default=5)
     args = parser.parse_args()
