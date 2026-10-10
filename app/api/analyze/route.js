@@ -3,14 +3,15 @@ import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 export const runtime = "nodejs";
-export const maxDuration = 120;
+export const maxDuration = 300;
 
 const ROOT = process.cwd();
-const UPLOAD_DIR = path.join(ROOT, "data", "uploads");
+const UPLOAD_DIR = path.join(/* turbopackIgnore: true */ ROOT, "data", "uploads");
+const PYTHON_BIN = process.env.REVIEW_RAG_PYTHON || "D:\\pyt\\python.exe";
 
 function runPython(args) {
   return new Promise((resolve, reject) => {
-    const child = spawn("python", args, {
+    const child = spawn(PYTHON_BIN, args, {
       cwd: ROOT,
       env: { ...process.env, PYTHONIOENCODING: "utf-8" },
       windowsHide: true
@@ -39,8 +40,9 @@ function runPython(args) {
 export async function POST(request) {
   const form = await request.formData();
   const text = String(form.get("text") || "").trim();
+  const mode = String(form.get("mode") || "review").trim() === "paper" ? "paper" : "review";
   const file = form.get("file");
-  const args = ["query_review_api.py", "--top-k", "100", "--min-similarity", "0.45", "--limit", "5"];
+  const args = ["query_review_api.py", "--mode", mode, "--top-k", "100", "--min-similarity", "0.45", "--limit", "5"];
 
   if (file && typeof file === "object" && file.size > 0) {
     await mkdir(UPLOAD_DIR, { recursive: true });
@@ -57,7 +59,7 @@ export async function POST(request) {
   } else if (text) {
     args.push("--text", text);
   } else {
-    return Response.json({ error: "请上传审稿意见文件，或粘贴审稿意见文本。" }, { status: 400 });
+    return Response.json({ error: "请上传论文/审稿意见文件，或粘贴文本。" }, { status: 400 });
   }
 
   try {
